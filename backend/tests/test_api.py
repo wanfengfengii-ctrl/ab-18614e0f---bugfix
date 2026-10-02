@@ -170,7 +170,39 @@ def test_shared_cooling_obstruction_diagnostic():
     data = r.json()
     assert data["feasible"] is False
     ob = data["cooling_obstruction"]
-    assert ob == {"exposure_id": "B", "entry_index": 1, "feasible_count": 1}
+    assert ob["exposure_id"] == "B" and ob["entry_index"] == 1
+
+
+def test_shared_cooling_obstruction_follows_startup_order():
+    # Entry order A,B,C,D,E but startup order B,C,D,E,A: B draws first and
+    # succeeds (10 -> 4), A draws last at t=1 and exhausts the cooler
+    # (4 -> -2). The diagnostic must name A, not the healthy B.
+    body = {
+        "horizon": 1000,
+        "exposures": [
+            _exposure("A", equipment="X", duration=1, startup_consumption=6,
+                      earliest_start=1, latest_start=1),
+            _exposure("B", equipment="Y", duration=1, startup_consumption=6,
+                      earliest_start=0, latest_start=0),
+            _exposure("C", equipment="Z", duration=1, startup_consumption=0,
+                      earliest_start=0, latest_start=0),
+            _exposure("D", equipment="W", duration=1, startup_consumption=0,
+                      earliest_start=0, latest_start=0),
+            _exposure("E", equipment="V", duration=1, startup_consumption=0,
+                      earliest_start=0, latest_start=0),
+        ],
+        "links": [],
+        "shared_cooling": {"capacity": 10, "initial": 10, "recovery": 0},
+    }
+    r = client.post("/api/schedule", json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["feasible"] is False
+    assert data["reason"] == "no_schedule"
+    for k in ("starts", "finishes", "makespan", "sum_starts",
+              "slacks", "equipment_orders", "cooling_trace"):
+        assert data[k] is None
+    assert data["cooling_obstruction"]["exposure_id"] == "A"
 
 
 def test_disabled_cooling_response_shape_unchanged():

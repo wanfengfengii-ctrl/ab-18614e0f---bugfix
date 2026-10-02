@@ -105,8 +105,10 @@ class EquipmentOrder(BaseModel):
 class CoolingObstruction(BaseModel):
     """Diagnostic: shared cooling alone makes the timing impossible.
 
-    ``entry_index`` is the first exposure (in entry order) whose inclusion
-    makes the cooling-only relaxation infeasible.
+    ``entry_index`` identifies the exposure whose startup draw is the first
+    that cannot be covered in the global startup sequence (ordered by start
+    time, then by entry order); ``feasible_count`` is the number of startup
+    events before it whose deductions still complete.
     """
 
     exposure_id: str

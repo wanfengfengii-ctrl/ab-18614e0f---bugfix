@@ -178,7 +178,8 @@ def test_partial_draw_larger_than_capacity_is_infeasible_not_input_error(builder
 
 def test_obstruction_points_at_first_exhausting_draw(builder, E, C):
     # A(6) fits at t=0 (level 4); B(6) can never be afforded within window 4
-    # with zero recovery — B is the step that exhausts the cooler.
+    # with zero recovery — B is the step that exhausts the cooler. The three
+    # zero draws also succeed before B in the global startup sequence.
     exps = [
         E("A", duration=1, startup=6, equipment="X", latest=4),
         E("B", duration=1, startup=6, equipment="Y", latest=4),
@@ -190,7 +191,30 @@ def test_obstruction_points_at_first_exhausting_draw(builder, E, C):
     r = solve(req, phase_seconds=3)
     assert r["feasible"] is False
     ob = r["cooling_obstruction"]
-    assert ob == {"exposure_id": "B", "entry_index": 1, "feasible_count": 1}
+    assert ob == {"exposure_id": "B", "entry_index": 1, "feasible_count": 4}
+
+
+def test_obstruction_follows_startup_order_when_it_reverses_entry_order(builder, E, C):
+    # A is entered first but forced to start at t=1; B is entered second but
+    # starts at t=0; C/D/E are zero draws also at t=0. The actual startup
+    # sequence is B, C, D, E, A: B draws first (10 -> 4) and succeeds, while
+    # A draws last (4 -> -2) and is the exposure that exhausts the cooler.
+    # The diagnosis must name A, never the healthy B.
+    exps = [
+        E("A", duration=1, startup=6, equipment="X", earliest=1, latest=1),
+        E("B", duration=1, startup=6, equipment="Y", earliest=0, latest=0),
+        E("C", duration=1, startup=0, equipment="Z", earliest=0, latest=0),
+        E("D", duration=1, startup=0, equipment="W", earliest=0, latest=0),
+        E("E", duration=1, startup=0, equipment="V", earliest=0, latest=0),
+    ]
+    req = builder(exps, shared_cooling=C(capacity=10, initial=10, recovery=0))
+    r = solve(req, phase_seconds=3)
+    assert r["feasible"] is False
+    assert r.get("starts") is None
+    ob = r["cooling_obstruction"]
+    assert ob["exposure_id"] == "A"
+    assert ob["entry_index"] == 0
+    assert ob["feasible_count"] == 4  # B, C, D, E succeed before A
 
 
 def test_no_obstruction_when_cooling_alone_is_feasible(builder, E, C):
@@ -204,6 +228,49 @@ def test_no_obstruction_when_cooling_alone_is_feasible(builder, E, C):
         E("E", duration=1, startup=0, equipment="W"),
     ]
     req = builder(exps, shared_cooling=C(capacity=10, initial=10, recovery=5))
+    r = solve(req, phase_seconds=3)
+    assert r["feasible"] is False
+    assert r.get("cooling_obstruction") is None
+
+
+def test_obstruction_among_same_time_draws_uses_entry_order(builder, E, C):
+    # All five fixed at t=0 with no recovery: same-time draws deduct
+    # back-to-back in entry order. A (4): 10 -> 6, B (3): 6 -> 3, C (4):
+    # 3 -> -1. C is the first draw that cannot complete; zero draws after it
+    # are irrelevant.
+    exps = [
+        E("A", duration=1, startup=4, equipment="X", earliest=0, latest=0),
+        E("B", duration=1, startup=3, equipment="Y", earliest=0, latest=0),
+        E("C", duration=1, startup=4, equipment="Z", earliest=0, latest=0),
+        E("D", duration=1, startup=0, equipment="W", earliest=0, latest=0),
+        E("E", duration=1, startup=0, equipment="V", earliest=0, latest=0),
+    ]
+    req = builder(exps, shared_cooling=C(capacity=10, initial=10, recovery=0))
+    r = solve(req, phase_seconds=3)
+    assert r["feasible"] is False
+    ob = r["cooling_obstruction"]
+    assert ob["exposure_id"] == "C"
+    assert ob["feasible_count"] == 2
+
+
+def test_no_obstruction_when_links_cause_infeasibility(builder, E, C):
+    # A cyclic max-gap link pair is infeasible on independent equipment, while
+    # the cooler budget is ample: the failure must not be blamed on cooling.
+    exps = [
+        E("A", duration=1, startup=1, equipment="X"),
+        E("B", duration=1, startup=1, equipment="Y"),
+        E("C", duration=1, startup=0, equipment="Z"),
+        E("D", duration=1, startup=0, equipment="W"),
+        E("E", duration=1, startup=0, equipment="V"),
+    ]
+    req = builder(
+        exps,
+        links=[
+            Link(from_id="A", to_id="B", min_gap=0, max_gap=1),
+            Link(from_id="B", to_id="A", min_gap=0, max_gap=1),
+        ],
+        shared_cooling=C(capacity=10, initial=10, recovery=5),
+    )
     r = solve(req, phase_seconds=3)
     assert r["feasible"] is False
     assert r.get("cooling_obstruction") is None

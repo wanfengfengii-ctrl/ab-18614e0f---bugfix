@@ -280,6 +280,66 @@ def check_shared_cooling():
             raise RuntimeError(f"expected exhaustion at B as obstruction, got {ob}")
         print(f"  insufficient cooling correctly infeasible; exhaustion at {ob}")
 
+        # Reversed entry/startup order: A entered first but fixed at t=1, B
+        # entered second but starts at t=0, three zero draws also at t=0.
+        # Actual startup sequence is B,C,D,E,A: B succeeds (10 -> 4) and A is
+        # the draw that goes negative. The obstruction must point at A, never
+        # at the healthy B, and must not leak any partial schedule.
+        rev = {
+            "horizon": 1000,
+            "exposures": [
+                {"id": "A", "duration": 1, "earliest_start": 1, "latest_start": 1,
+                 "equipment": "X", "cooling": 0, "startup_consumption": 6},
+                {"id": "B", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "Y", "cooling": 0, "startup_consumption": 6},
+                {"id": "C", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "Z", "cooling": 0, "startup_consumption": 0},
+                {"id": "D", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "W", "cooling": 0, "startup_consumption": 0},
+                {"id": "E", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "V", "cooling": 0, "startup_consumption": 0},
+            ],
+            "links": [],
+            "shared_cooling": {"capacity": 10, "initial": 10, "recovery": 0},
+        }
+        r2b = cli.post("/api/schedule", json=rev)
+        if r2b.status_code != 200:
+            raise RuntimeError(f"reversed case HTTP {r2b.status_code}: {r2b.text[:200]}")
+        d2b = r2b.json()
+        if d2b.get("feasible") is not False:
+            raise RuntimeError(f"reversed case must be infeasible: {d2b}")
+        if any(d2b.get(k) is not None for k in
+               ("starts", "finishes", "makespan", "cooling_trace")):
+            raise RuntimeError("partial schedule/trace returned on reversed case")
+        ob2 = d2b.get("cooling_obstruction")
+        if not ob2 or ob2.get("exposure_id") != "A":
+            raise RuntimeError(
+                f"reversed case must name A (first unpayable draw in startup "
+                f"order B,C,D,E,A), got {ob2}")
+        if ob2.get("feasible_count") != 4:
+            raise RuntimeError(
+                f"reversed case: 4 startup events (B,C,D,E) precede the "
+                f"exhausting draw, got feasible_count={ob2.get('feasible_count')}")
+        print(f"  reversed entry/startup order: exhaustion correctly at {ob2}")
+
+        # Infeasibility caused by equipment, not cooling: no cooling culprit
+        # may be claimed even with shared cooling enabled.
+        eq_body = _cooling_five(
+            [0, 0, 0, 0, 0], {"capacity": 10, "initial": 10, "recovery": 5})
+        for e in eq_body["exposures"]:
+            if e["id"] in ("A", "B"):
+                e["equipment"] = "Q"
+                e["duration"] = 5
+                e["latest_start"] = 4
+        r2c = cli.post("/api/schedule", json=eq_body)
+        if r2c.status_code != 200 or r2c.json().get("feasible") is not False:
+            raise RuntimeError(f"equipment-infeasible case unexpected: {r2c.text[:200]}")
+        if r2c.json().get("cooling_obstruction") is not None:
+            raise RuntimeError(
+                f"equipment-caused infeasibility misreported as cooling "
+                f"exhaustion: {r2c.json().get('cooling_obstruction')}")
+        print("  equipment-caused infeasibility not misreported as cooling")
+
         # Initial level above capacity is an input error (400), never no_schedule.
         bad_input = _cooling_five(
             [1, 1, 1, 1, 1], {"capacity": 5, "initial": 6, "recovery": 1})

@@ -92,7 +92,9 @@ def validate_request(req: ScheduleRequest) -> None:
         raise InputValidationError(errors)
 
 
-def _build_model(req: ScheduleRequest) -> Tuple[cp_model.CpModel, Dict[str, Any]]:
+def _build_model(
+    req: ScheduleRequest, cooling_soft: bool = False
+) -> Tuple[cp_model.CpModel, Dict[str, Any]]:
     model = cp_model.CpModel()
     exps: List[Exposure] = req.exposures
     n = len(exps)
@@ -133,7 +135,9 @@ def _build_model(req: ScheduleRequest) -> Tuple[cp_model.CpModel, Dict[str, Any]
 
     cooling_vars: Dict[str, Any] = {}
     if req.shared_cooling is not None:
-        cooling_vars = _add_shared_cooling(model, exps, starts, req.shared_cooling, H)
+        cooling_vars = _add_shared_cooling(
+            model, exps, starts, req.shared_cooling, H, soft=cooling_soft
+        )
 
     return model, {
         "starts": starts,
@@ -151,6 +155,7 @@ def _add_shared_cooling(
     starts: List[cp_model.IntVar],
     sc: SharedCooling,
     H: int,
+    soft: bool = False,
 ) -> Dict[str, Any]:
     """Model the shared cryocooler budget inside the CP-SAT model.
 
@@ -165,6 +170,13 @@ def _add_shared_cooling(
     the start variables, the budget participates in feasibility and in all
     three lexicographic optimization phases — it can force starts later, but
     solutions are never filtered after solving.
+
+    With ``soft=True`` the non-negativity of each post-draw level is an
+    optional (reified) constraint instead of a hard one, and the ledger
+    variables are allowed to go negative; the returned ``nonneg`` booleans
+    mark which startup events still keep the level non-negative. The
+    feasibility of the windows/ordering part is unchanged, so this is only
+    used to explain *where* an otherwise-infeasible cooler runs dry.
     """
     n = len(exps)
 
@@ -193,8 +205,15 @@ def _add_shared_cooling(
     model.add_inverse(ranks, q)
 
     # Chronological start times, consumptions and ledger variables.
+    # In soft mode a single draw larger than the capacity must stay
+    # representable (it is precisely what forces an event below zero);
+    # the hard model keeps the capacity bound so such draws stay infeasible.
+    cons_bound = (
+        max([sc.capacity] + [e.startup_consumption for e in exps])
+        if soft else sc.capacity
+    )
     seq_start = [model.new_int_var(0, H, f"cool_seqstart_{k}") for k in range(n)]
-    seq_cons = [model.new_int_var(0, sc.capacity, f"cool_seqcons_{k}") for k in range(n)]
+    seq_cons = [model.new_int_var(0, cons_bound, f"cool_seqcons_{k}") for k in range(n)]
     consumptions = [model.new_constant(e.startup_consumption) for e in exps]
     for k in range(n):
         model.add_element(q[k], starts, seq_start[k])
@@ -205,6 +224,13 @@ def _add_shared_cooling(
     levels_before: List[cp_model.IntVar] = []
     levels_after: List[cp_model.IntVar] = []
     same_flags: List[cp_model.IntVar] = []
+    # In soft mode nonneg[k] says event k still settles non-negatively; in
+    # hard mode the list stays empty and the [0, capacity] domains enforce
+    # non-negativity directly.
+    nonneg_flags: List[cp_model.IntVar] = []
+    # Even after every draw the level can fall no further than minus the
+    # total amount ever drawn.
+    level_lb = -sum(e.startup_consumption for e in exps) if soft else 0
 
     prev_after: Optional[cp_model.IntVar] = None
     for k in range(n):
@@ -229,15 +255,26 @@ def _add_shared_cooling(
         recoveries.append(rec)
 
         if prev_after is None:
-            before = model.new_int_var(0, sc.capacity, f"cool_before_{k}")
+            before = model.new_int_var(level_lb, sc.capacity, f"cool_before_{k}")
             model.add_min_equality(before, [sc.initial + rec, sc.capacity])
         else:
-            before = model.new_int_var(0, sc.capacity, f"cool_before_{k}")
+            before = model.new_int_var(level_lb, sc.capacity, f"cool_before_{k}")
             model.add_min_equality(before, [prev_after + rec, sc.capacity])
         levels_before.append(before)
 
-        after = model.new_int_var(0, sc.capacity, f"cool_after_{k}")
+        after = model.new_int_var(level_lb, sc.capacity, f"cool_after_{k}")
         model.add(after == before - seq_cons[k])
+        if soft:
+            ok = model.new_bool_var(f"cool_nonneg_{k}")
+            # One-way implication only: ok == 1 forces a non-negative level.
+            # The converse is deliberately *not* enforced, because a later
+            # event after recovery may legitimately settle non-negatively
+            # even though an earlier one overdrew; maximization below still
+            # makes the surviving events a startup-sequence prefix.
+            model.add(after >= 0).only_enforce_if(ok)
+            if k > 0:
+                model.add(ok <= nonneg_flags[k - 1])
+            nonneg_flags.append(ok)
         levels_after.append(after)
         prev_after = after
 
@@ -250,6 +287,7 @@ def _add_shared_cooling(
         "recoveries": recoveries,
         "levels_before": levels_before,
         "levels_after": levels_after,
+        "nonneg": nonneg_flags,
     }
 
 
@@ -257,20 +295,16 @@ class SolverTimeoutError(RuntimeError):
     """The solver could not decide within the time limit (status UNKNOWN)."""
 
 
-def _cooling_only_request(req: ScheduleRequest,
-                          prefix: Optional[int] = None) -> Any:
+def _cooling_only_request(req: ScheduleRequest) -> Any:
     """Build a cooling-only relaxation, bypassing the 5-10 exposure schema.
 
     Every exposure gets its own equipment and links are dropped, so the only
     remaining constraints are start windows plus the shared-cooling budget.
-    ``prefix`` keeps just the first ``prefix`` exposures (entry order);
-    internal sub-problems may therefore contain fewer than five exposures.
     """
     from types import SimpleNamespace
 
-    exps = list(req.exposures[:prefix] if prefix is not None else req.exposures)
     relaxed = []
-    for i, e in enumerate(exps):
+    for i, e in enumerate(req.exposures):
         data = e.model_dump()
         data["equipment"] = f"__cool_only_{i}"
         relaxed.append(Exposure(**data))
@@ -286,17 +320,28 @@ def _diagnose_cooling_exhaustion(
     req: ScheduleRequest, phase_seconds: float
 ) -> Optional[Dict[str, Any]]:
     """If the shared-cooling budget alone makes the plan impossible, identify
-    the first exposure (in entry order) whose inclusion makes the
-    cooling-only problem infeasible.
+    the first startup event whose draw cannot be covered.
 
-    Returns None when cooling is not the proven obstruction (equipment/links
-    may still be) or when the diagnosis itself hits the time limit. This is
-    an explanation only — it never returns a partial schedule.
+    The cooling-only relaxation (distinct equipment per exposure, links
+    dropped) is first checked with the *hard* cooling model: if it is
+    feasible the obstruction lies elsewhere (equipment/links), and if the
+    solver cannot decide in time no culprit is claimed.
+
+    When cooling alone is proven infeasible, a *soft* variant of the same
+    model lets post-draw levels go negative. Maximizing the number of
+    non-negative startup events yields the longest achievable run of
+    successful deductions along the global startup sequence
+    ``(start time, entry index)``; ties are broken by the lexicographically
+    smallest entry-order start vector, mirroring phase 3 of the real
+    optimization. The first event after that run is the exposure at which
+    the cooler is exhausted in that sequence — which, unlike an entry-order
+    prefix test, stays correct when entry order and startup order differ.
+    This is an explanation only; it never returns a partial schedule.
     """
     if req.shared_cooling is None:
         return None
 
-    def status_of(sub: ScheduleRequest) -> Optional[int]:
+    def hard_status(sub: ScheduleRequest) -> Optional[int]:
         model, v = _build_model(sub)
         _solver, status, _name = _solve_phase(model, v, phase_seconds, None)
         # None status would mean UNKNOWN (time limit); INFEASIBLE is reported
@@ -305,31 +350,72 @@ def _diagnose_cooling_exhaustion(
             return status
         return None
 
-    full = status_of(_cooling_only_request(req))
-    if full != cp_model.INFEASIBLE:
+    cool_req = _cooling_only_request(req)
+    if hard_status(cool_req) != cp_model.INFEASIBLE:
         # UNKNOWN -> cannot claim cooling is the culprit; OPTIMAL/FEASIBLE ->
         # the cooling budget alone is satisfiable, so something else blocks it.
         return None
 
-    n = len(req.exposures)
-    lo = 1
-    hi = n
-    # Smallest entry-order prefix whose cooling-only problem is infeasible.
-    # Infeasibility is monotone as exposures are appended.
-    while lo < hi:
-        mid = (lo + hi) // 2
-        st = status_of(_cooling_only_request(req, mid))
-        if st is None:
-            return None  # diagnosis hit the time limit; do not guess
-        if st == cp_model.INFEASIBLE:
-            hi = mid
+    n = len(cool_req.exposures)
+
+    # Stage 1: soft model, maximize the number of startup events that settle
+    # non-negatively (the longest achievable successful-deduction run).
+    model, v = _build_model(cool_req, cooling_soft=True)
+    model.maximize(sum(v["cooling"]["nonneg"]))
+    solver, status, _name = _solve_phase(model, v, phase_seconds, None)
+    if solver is None or status != cp_model.OPTIMAL:
+        # UNKNOWN/non-optimal: the maximal run length was not proven, so
+        # naming a culprit could misdirect operators; decline to diagnose.
+        return None
+    feasible_value = solver.value(sum(v["cooling"]["nonneg"]))
+    if feasible_value >= n:
+        # Defensive: the hard model was infeasible, yet no draw overdraws.
+        return None
+
+    # Stage 2: among plans achieving that run length, take the
+    # lexicographically smallest entry-order start vector, one var per stage.
+    pinned: List[int] = []
+    for i in range(n):
+        m, vv = _build_model(cool_req, cooling_soft=True)
+        m.add(sum(vv["cooling"]["nonneg"]) == feasible_value)
+        # Only earlier entry-order vars are pinned; the current one and all
+        # later ones remain free to be minimized (later stages re-pin this).
+        for j in range(i):
+            m.add(vv["starts"][j] == pinned[j])
+        m.minimize(vv["starts"][i])
+        s, status, _name = _solve_phase(m, vv, phase_seconds, pinned or None)
+        if s is None or status != cp_model.OPTIMAL:
+            return None
+        pinned = [s.value(x) for x in vv["starts"]]
+    starts_values = pinned
+
+    # Replay the ledger over the chosen start vector; the first event whose
+    # draw cannot be covered is the exhaustion exposure.
+    sc = req.shared_cooling
+    order = sorted(range(n), key=lambda i: (starts_values[i], i))
+    level: Optional[int] = None
+    prev_t: Optional[int] = None
+    culprit: Optional[int] = None
+    for i in order:
+        t = starts_values[i]
+        if level is None:
+            rec = t * sc.recovery
+            level = min(sc.initial + rec, sc.capacity)
         else:
-            lo = mid + 1
-    culprit = req.exposures[lo - 1]
+            rec = 0 if t == prev_t else (t - prev_t) * sc.recovery
+            level = min(level + rec, sc.capacity)
+        level -= req.exposures[i].startup_consumption
+        if level < 0:
+            culprit = i
+            break
+        prev_t = t
+
+    if culprit is None:
+        return None
     return {
-        "exposure_id": culprit.id,
-        "entry_index": lo - 1,
-        "feasible_count": lo - 1,
+        "exposure_id": req.exposures[culprit].id,
+        "entry_index": culprit,
+        "feasible_count": feasible_value,
     }
 
 
