@@ -92,7 +92,9 @@ def validate_request(req: ScheduleRequest) -> None:
         raise InputValidationError(errors)
 
 
-def _build_model(req: ScheduleRequest) -> Tuple[cp_model.CpModel, Dict[str, Any]]:
+def _build_model(
+    req: ScheduleRequest, allow_cooling_deficit: bool = False
+) -> Tuple[cp_model.CpModel, Dict[str, Any]]:
     model = cp_model.CpModel()
     exps: List[Exposure] = req.exposures
     n = len(exps)
@@ -133,7 +135,10 @@ def _build_model(req: ScheduleRequest) -> Tuple[cp_model.CpModel, Dict[str, Any]
 
     cooling_vars: Dict[str, Any] = {}
     if req.shared_cooling is not None:
-        cooling_vars = _add_shared_cooling(model, exps, starts, req.shared_cooling, H)
+        cooling_vars = _add_shared_cooling(
+            model, exps, starts, req.shared_cooling, H,
+            allow_deficit=allow_cooling_deficit,
+        )
 
     return model, {
         "starts": starts,
@@ -151,6 +156,7 @@ def _add_shared_cooling(
     starts: List[cp_model.IntVar],
     sc: SharedCooling,
     H: int,
+    allow_deficit: bool = False,
 ) -> Dict[str, Any]:
     """Model the shared cryocooler budget inside the CP-SAT model.
 
@@ -165,6 +171,13 @@ def _add_shared_cooling(
     the start variables, the budget participates in feasibility and in all
     three lexicographic optimization phases — it can force starts later, but
     solutions are never filtered after solving.
+
+    With ``allow_deficit`` the non-negativity requirement is relaxed: each
+    sequence position carries a non-negative deficit ``d[k]`` with
+    ``after[k] == before[k] - cons[k] + d[k]`` and levels are allowed to go
+    negative. Minimizing the deficit vector lexicographically yields the
+    witness used to explain *where* in the global startup sequence cooling is
+    first unavoidably short.
     """
     n = len(exps)
 
@@ -193,8 +206,10 @@ def _add_shared_cooling(
     model.add_inverse(ranks, q)
 
     # Chronological start times, consumptions and ledger variables.
+    max_cons = max((e.startup_consumption for e in exps), default=0)
     seq_start = [model.new_int_var(0, H, f"cool_seqstart_{k}") for k in range(n)]
-    seq_cons = [model.new_int_var(0, sc.capacity, f"cool_seqcons_{k}") for k in range(n)]
+    cons_bound = max(max_cons, sc.capacity) if allow_deficit else sc.capacity
+    seq_cons = [model.new_int_var(0, cons_bound, f"cool_seqcons_{k}") for k in range(n)]
     consumptions = [model.new_constant(e.startup_consumption) for e in exps]
     for k in range(n):
         model.add_element(q[k], starts, seq_start[k])
@@ -204,7 +219,9 @@ def _add_shared_cooling(
     recoveries: List[cp_model.IntVar] = []
     levels_before: List[cp_model.IntVar] = []
     levels_after: List[cp_model.IntVar] = []
+    deficits: List[cp_model.IntVar] = []
     same_flags: List[cp_model.IntVar] = []
+    deficit_bound = max(max_cons, 1)
 
     prev_after: Optional[cp_model.IntVar] = None
     for k in range(n):
@@ -236,8 +253,17 @@ def _add_shared_cooling(
             model.add_min_equality(before, [prev_after + rec, sc.capacity])
         levels_before.append(before)
 
-        after = model.new_int_var(0, sc.capacity, f"cool_after_{k}")
-        model.add(after == before - seq_cons[k])
+        if allow_deficit:
+            # Minimum external cooling units forced into this draw; zero means
+            # the draw is fully fundable. after stays non-negative because the
+            # injected deficit covers any shortfall.
+            deficit = model.new_int_var(0, deficit_bound, f"cool_deficit_{k}")
+            after = model.new_int_var(0, sc.capacity, f"cool_after_{k}")
+            model.add(after == before - seq_cons[k] + deficit)
+            deficits.append(deficit)
+        else:
+            after = model.new_int_var(0, sc.capacity, f"cool_after_{k}")
+            model.add(after == before - seq_cons[k])
         levels_after.append(after)
         prev_after = after
 
@@ -250,6 +276,7 @@ def _add_shared_cooling(
         "recoveries": recoveries,
         "levels_before": levels_before,
         "levels_after": levels_after,
+        "deficits": deficits,
     }
 
 
@@ -257,20 +284,16 @@ class SolverTimeoutError(RuntimeError):
     """The solver could not decide within the time limit (status UNKNOWN)."""
 
 
-def _cooling_only_request(req: ScheduleRequest,
-                          prefix: Optional[int] = None) -> Any:
+def _cooling_only_request(req: ScheduleRequest) -> Any:
     """Build a cooling-only relaxation, bypassing the 5-10 exposure schema.
 
     Every exposure gets its own equipment and links are dropped, so the only
     remaining constraints are start windows plus the shared-cooling budget.
-    ``prefix`` keeps just the first ``prefix`` exposures (entry order);
-    internal sub-problems may therefore contain fewer than five exposures.
     """
     from types import SimpleNamespace
 
-    exps = list(req.exposures[:prefix] if prefix is not None else req.exposures)
     relaxed = []
-    for i, e in enumerate(exps):
+    for i, e in enumerate(req.exposures):
         data = e.model_dump()
         data["equipment"] = f"__cool_only_{i}"
         relaxed.append(Exposure(**data))
@@ -285,51 +308,103 @@ def _cooling_only_request(req: ScheduleRequest,
 def _diagnose_cooling_exhaustion(
     req: ScheduleRequest, phase_seconds: float
 ) -> Optional[Dict[str, Any]]:
-    """If the shared-cooling budget alone makes the plan impossible, identify
-    the first exposure (in entry order) whose inclusion makes the
-    cooling-only problem infeasible.
+    """When the shared-cooling budget alone makes the plan impossible, point
+    at the first draw that cannot be completed in the global startup sequence.
+
+    The procedure first proves (via the strict CP model) that even with
+    equipment and link constraints dropped, no start assignment satisfies the
+    time windows plus the cooler budget. It then solves a *deficit* relaxation
+    of the same cooling-only problem: each position ``k`` in the global
+    startup sequence carries a non-negative deficit ``d[k]`` covering any
+    shortfall at that draw (``after = before - consumption + d``). The deficit
+    vector is minimized lexicographically, position by position, so the first
+    position whose minimal deficit is positive is the earliest startup event
+    for which no start-time assignment can fund the draw — the first exposure
+    that cannot complete its cooling deduction. Because the sequence itself is
+    derived from the start variables with equal-time ties in entry order, this
+    follows the real startup order: an exposure entered first but starting
+    later is only blamed when its own draw fails, after earlier-starting
+    draws that genuinely consume the budget first.
+
+    Ties among assignments sharing the minimum deficit vector are broken by
+    lex-minimizing the entry-order start vector, exactly like phase 3 of the
+    main solve, so the diagnosis is deterministic.
 
     Returns None when cooling is not the proven obstruction (equipment/links
-    may still be) or when the diagnosis itself hits the time limit. This is
-    an explanation only — it never returns a partial schedule.
+    may still be) or when any proof hits the time limit. This is an
+    explanation only — it never returns a partial schedule.
     """
     if req.shared_cooling is None:
         return None
 
-    def status_of(sub: ScheduleRequest) -> Optional[int]:
-        model, v = _build_model(sub)
-        _solver, status, _name = _solve_phase(model, v, phase_seconds, None)
-        # None status would mean UNKNOWN (time limit); INFEASIBLE is reported
-        # by _solve_phase even though it hands back no solver object.
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.INFEASIBLE):
-            return status
+    relaxed = _cooling_only_request(req)
+
+    model, v = _build_model(relaxed)
+    _solver, status, _name = _solve_phase(model, v, phase_seconds, None)
+    # None status would mean UNKNOWN (time limit); INFEASIBLE is reported even
+    # though _solve_phase hands back no solver object.
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.INFEASIBLE):
+        return None
+    if status != cp_model.INFEASIBLE:
+        # Cooling alone is satisfiable, so equipment/link constraints explain
+        # the original failure — do not blame the cooler.
         return None
 
-    full = status_of(_cooling_only_request(req))
-    if full != cp_model.INFEASIBLE:
-        # UNKNOWN -> cannot claim cooling is the culprit; OPTIMAL/FEASIBLE ->
-        # the cooling budget alone is satisfiable, so something else blocks it.
+    n = len(relaxed.exposures)
+
+    # Stage 1: lex-minimize the deficit vector along the startup sequence.
+    # Each pinned value must be a proven minimum, so only OPTIMAL counts.
+    min_deficits: Dict[int, int] = {}
+    hint: Optional[List[int]] = None
+    for k in range(n):
+        mdl, vars_ = _build_model(relaxed, allow_cooling_deficit=True)
+        cv = vars_["cooling"]
+        for j, val in min_deficits.items():
+            mdl.add(cv["deficits"][j] == val)
+        mdl.minimize(cv["deficits"][k])
+        solver, st, _ = _solve_phase(mdl, vars_, phase_seconds, hint)
+        if st != cp_model.OPTIMAL:
+            return None
+        min_deficits[k] = solver.value(cv["deficits"][k])
+        hint = [solver.value(s) for s in vars_["starts"]]
+
+    first_gap = next((k for k, dval in min_deficits.items() if dval > 0), None)
+    if first_gap is None:
+        # Strict model proven infeasible yet every draw needs zero deficit
+        # cannot happen (that assignment would be feasible); do not guess.
         return None
 
-    n = len(req.exposures)
-    lo = 1
-    hi = n
-    # Smallest entry-order prefix whose cooling-only problem is infeasible.
-    # Infeasibility is monotone as exposures are appended.
-    while lo < hi:
-        mid = (lo + hi) // 2
-        st = status_of(_cooling_only_request(req, mid))
-        if st is None:
-            return None  # diagnosis hit the time limit; do not guess
-        if st == cp_model.INFEASIBLE:
-            hi = mid
-        else:
-            lo = mid + 1
-    culprit = req.exposures[lo - 1]
+    # Stage 2: canonical tie-break — lex-minimize starts in entry order with
+    # the whole minimum deficit vector pinned; each value must be a minimum.
+    # The final iteration leaves every start pinned, so its solver already
+    # holds the canonical witness used to read out the culprit.
+    pinned_starts: Dict[int, int] = {}
+    solver: Optional[cp_model.CpSolver] = None
+    cv: Dict[str, Any] = {}
+    for i in range(n):
+        mdl, vars_ = _build_model(relaxed, allow_cooling_deficit=True)
+        cv = vars_["cooling"]
+        for j, val in min_deficits.items():
+            mdl.add(cv["deficits"][j] == val)
+        for j, val in pinned_starts.items():
+            mdl.add(vars_["starts"][j] == val)
+        mdl.minimize(vars_["starts"][i])
+        solver, st, _ = _solve_phase(mdl, vars_, phase_seconds, hint)
+        if st != cp_model.OPTIMAL:
+            return None
+        hint = [solver.value(s) for s in vars_["starts"]]
+        pinned_starts[i] = hint[i]
+
+    k = first_gap
+    culprit_index = solver.value(cv["q"][k])
     return {
-        "exposure_id": culprit.id,
-        "entry_index": lo - 1,
-        "feasible_count": lo - 1,
+        "exposure_id": relaxed.exposures[culprit_index].id,
+        "entry_index": culprit_index,
+        "startup_order_index": k,
+        "start": solver.value(cv["seq_start"][k]),
+        "level_before": solver.value(cv["levels_before"][k]),
+        "consumption": solver.value(cv["seq_cons"][k]),
+        "deficit": min_deficits[k],
     }
 
 

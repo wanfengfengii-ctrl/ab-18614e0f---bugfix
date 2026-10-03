@@ -177,8 +177,8 @@ def test_partial_draw_larger_than_capacity_is_infeasible_not_input_error(builder
 
 
 def test_obstruction_points_at_first_exhausting_draw(builder, E, C):
-    # A(6) fits at t=0 (level 4); B(6) can never be afforded within window 4
-    # with zero recovery — B is the step that exhausts the cooler.
+    # A(6) can draw at t=0 (level 4); B(6) can never be afforded within window
+    # 4 with zero recovery — B is the step that exhausts the cooler.
     exps = [
         E("A", duration=1, startup=6, equipment="X", latest=4),
         E("B", duration=1, startup=6, equipment="Y", latest=4),
@@ -190,7 +190,101 @@ def test_obstruction_points_at_first_exhausting_draw(builder, E, C):
     r = solve(req, phase_seconds=3)
     assert r["feasible"] is False
     ob = r["cooling_obstruction"]
-    assert ob == {"exposure_id": "B", "entry_index": 1, "feasible_count": 1}
+    assert ob["exposure_id"] == "B" and ob["entry_index"] == 1
+    # B is the last startup event (A + three zero draws precede it) and is
+    # short by exactly two units: 6 - 4.
+    assert ob["startup_order_index"] == 4
+    assert ob["level_before"] == 4 and ob["consumption"] == 6
+    assert ob["deficit"] == 2
+
+
+def test_obstruction_follows_startup_order_not_entry_order(builder, E, C):
+    # A is entered first but pinned to start at t=1; B entered second starts
+    # at t=0. The actual startup sequence is B(6), C(0), D(0), E(0), A(6).
+    # B leaves level 4; A at t=1 (no recovery) is the draw that cannot be
+    # completed. The diagnosis must name A, not B.
+    exps = [
+        E("A", duration=1, startup=6, equipment="X", earliest=1, latest=1),
+        E("B", duration=1, startup=6, equipment="Y", earliest=0, latest=0),
+        E("C", duration=1, startup=0, equipment="Z", earliest=0, latest=0),
+        E("D", duration=1, startup=0, equipment="W", earliest=0, latest=0),
+        E("E", duration=1, startup=0, equipment="V", earliest=0, latest=0),
+    ]
+    req = builder(exps, shared_cooling=C(capacity=10, initial=10, recovery=0))
+    r = solve(req, phase_seconds=5)
+    assert r["feasible"] is False
+    assert r.get("starts") is None
+    ob = r["cooling_obstruction"]
+    assert ob is not None
+    assert ob["exposure_id"] == "A"
+    assert ob["entry_index"] == 0
+    assert ob["startup_order_index"] == 4
+    assert ob["start"] == 1
+    assert ob["level_before"] == 4 and ob["consumption"] == 6
+    assert ob["deficit"] == 2
+
+
+def test_obstruction_same_time_draws_keep_entry_order(builder, E, C):
+    # All three positive draws are pinned to t=0 (plus two zero draws); same
+    # time draws deduct back-to-back in entry order C, D, E and the third
+    # positive draw (E) is the first that pushes below zero: 4+4 = 8, then 4
+    # against level 2 fails. E must be the culprit, even though every draw has
+    # an identical window.
+    exps = [
+        E("A", duration=1, startup=0, equipment="P", earliest=3, latest=3),
+        E("B", duration=1, startup=0, equipment="Q", earliest=3, latest=3),
+        E("C", duration=1, startup=4, equipment="X", earliest=0, latest=0),
+        E("D", duration=1, startup=4, equipment="Y", earliest=0, latest=0),
+        E("E", duration=1, startup=4, equipment="Z", earliest=0, latest=0),
+    ]
+    req = builder(exps, shared_cooling=C(capacity=10, initial=10, recovery=0))
+    r = solve(req, phase_seconds=5)
+    assert r["feasible"] is False
+    ob = r["cooling_obstruction"]
+    assert ob["exposure_id"] == "E"
+    assert ob["startup_order_index"] == 2
+    assert ob["level_before"] == 2 and ob["deficit"] == 2
+
+
+def test_obstruction_considers_recovery_and_capacity_cap(builder, E, C):
+    # Capacity 10, initial 6, recovery 2/unit. A(7) pinned at t=0 cannot fit
+    # (level capped at 6); delaying to t=1 gives 8 -> 1, so it is feasible in
+    # isolation. B(7) pinned at t=2 draws after recovery: 1 + 2 = 3 < 7, but
+    # B could instead be the witness failure only if its window leaves no
+    # room. Pin B at t=2 and the culprit is B with deficit 4.
+    exps = [
+        E("A", duration=1, startup=7, equipment="X", earliest=1, latest=1),
+        E("B", duration=1, startup=7, equipment="Y", earliest=2, latest=2),
+        E("C", duration=1, startup=0, equipment="Z", earliest=0, latest=0),
+        E("D", duration=1, startup=0, equipment="W", earliest=0, latest=0),
+        E("E", duration=1, startup=0, equipment="V", earliest=0, latest=0),
+    ]
+    req = builder(exps, shared_cooling=C(capacity=10, initial=6, recovery=2))
+    r = solve(req, phase_seconds=5)
+    assert r["feasible"] is False
+    ob = r["cooling_obstruction"]
+    assert ob["exposure_id"] == "B"
+    assert ob["start"] == 2
+    # t=1: min(6+2,10)=8, A draws 7 -> 1; t=2: +2 -> 3; B needs 7.
+    assert ob["level_before"] == 3 and ob["deficit"] == 4
+
+
+def test_no_obstruction_when_link_makes_it_infeasible(builder, E, C):
+    # Cooling is ample for every draw, but a max-gap link is impossible
+    # because A is pinned late and B early: no cooling culprit is claimed.
+    exps = [
+        E("A", duration=5, startup=0, equipment="X", earliest=10, latest=20),
+        E("B", duration=1, startup=0, equipment="Y", earliest=0, latest=0),
+        E("C", startup=0, equipment="Z"),
+        E("D", startup=0, equipment="W"),
+        E("E", startup=0, equipment="V"),
+    ]
+    link = Link(from_id="A", to_id="B", min_gap=0, max_gap=1)
+    req = builder(exps, links=[link],
+                  shared_cooling=C(capacity=10, initial=10, recovery=5))
+    r = solve(req, phase_seconds=3)
+    assert r["feasible"] is False
+    assert r.get("cooling_obstruction") is None
 
 
 def test_no_obstruction_when_cooling_alone_is_feasible(builder, E, C):

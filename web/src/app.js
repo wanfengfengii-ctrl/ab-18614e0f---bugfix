@@ -353,10 +353,13 @@ function renderObstruction(data) {
   }
   box.classList.remove("hidden");
   box.innerHTML =
-    `<strong>冷量在第 ${ob.entry_index + 1} 项曝光「${escapeHtml(ob.exposure_id)}」启动时耗尽。</strong>` +
-    `<br/>仅考虑时间窗与共享冷量（放宽设备与衔接）时，前 ${ob.feasible_count} 项尚可行，` +
-    `加入「${escapeHtml(ob.exposure_id)}」后在其允许的启动窗口内无论何时启动都无足够冷量；` +
-    `因此整体无解，且不返回任何部分排程。可增大容量/恢复量、调小该项启动耗量或放宽其最晚开始时刻。`;
+    `<strong>冷量在全局启动顺序第 ${ob.startup_order_index + 1} 个启动事件、` +
+    `曝光「${escapeHtml(ob.exposure_id)}」于时刻 ${ob.start} 启动时耗尽。</strong>` +
+    `<br/>仅考虑时间窗与共享冷量（放宽设备与衔接）时，排在它之前的启动扣减均可完成；` +
+    `该曝光启动时扣减前冷量为 ${ob.level_before}，而其启动耗量为 ${ob.consumption}，` +
+    `即使把开始时刻在其允许窗口内尽量推迟、并让各项按 (启动时刻, 录入顺序) 排列，` +
+    `仍缺 ${ob.deficit} 个单位冷量；因此整体无解，且不返回任何部分排程。` +
+    `可增大容量/恢复量、调小该项启动耗量或放宽其最晚开始时刻。`;
 }
 
 function drawCoolingLedger(r) {

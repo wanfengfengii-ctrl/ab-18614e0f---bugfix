@@ -105,13 +105,23 @@ class EquipmentOrder(BaseModel):
 class CoolingObstruction(BaseModel):
     """Diagnostic: shared cooling alone makes the timing impossible.
 
-    ``entry_index`` is the first exposure (in entry order) whose inclusion
-    makes the cooling-only relaxation infeasible.
+    The named exposure is the first startup draw that cannot be funded in
+    the global startup sequence (ordered by start time, then entry order):
+    after every earlier startup event is funded as early as the time windows
+    allow, this exposure's draw still exceeds the available level within its
+    own window. ``startup_order_index`` is its zero-based position in that
+    sequence, ``start`` is the witness startup time, and ``deficit`` is the
+    number of cooling units missing at that draw
+    (``consumption - level_before``).
     """
 
     exposure_id: str
     entry_index: int
-    feasible_count: int
+    startup_order_index: int
+    start: int
+    level_before: int
+    consumption: int
+    deficit: int
 
 
 class SolutionPayload(BaseModel):

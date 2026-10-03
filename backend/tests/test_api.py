@@ -170,7 +170,42 @@ def test_shared_cooling_obstruction_diagnostic():
     data = r.json()
     assert data["feasible"] is False
     ob = data["cooling_obstruction"]
-    assert ob == {"exposure_id": "B", "entry_index": 1, "feasible_count": 1}
+    assert ob["exposure_id"] == "B" and ob["entry_index"] == 1
+    # The witness states the failing draw explicitly: only 4 units remain when
+    # B needs 6, i.e. a deficit of 2.
+    assert ob["level_before"] == 4 and ob["consumption"] == 6
+    assert ob["deficit"] == 2
+    assert ob["startup_order_index"] == 4
+
+
+def test_shared_cooling_obstruction_follows_startup_order():
+    # Entry order and startup order disagree: A entered first but pinned to
+    # t=1, B entered second pinned to t=0. B draws 6 from 10 (leaves 4); A at
+    # t=1 is the draw that cannot complete. The API must name A.
+    body = _body(exposures=[
+        _exposure("A", equipment="X", duration=1,
+                  earliest_start=1, latest_start=1, startup_consumption=6),
+        _exposure("B", equipment="Y", duration=1,
+                  earliest_start=0, latest_start=0, startup_consumption=6),
+        _exposure("C", equipment="Z", duration=1,
+                  earliest_start=0, latest_start=0, startup_consumption=0),
+        _exposure("D", equipment="W", duration=1,
+                  earliest_start=0, latest_start=0, startup_consumption=0),
+        _exposure("E", equipment="V", duration=1,
+                  earliest_start=0, latest_start=0, startup_consumption=0),
+    ])
+    body["shared_cooling"] = {"capacity": 10, "initial": 10, "recovery": 0}
+    r = client.post("/api/schedule", json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["feasible"] is False
+    assert data["reason"] == "no_schedule"
+    for k in ("starts", "finishes", "cooling_trace"):
+        assert data[k] is None
+    ob = data["cooling_obstruction"]
+    assert ob["exposure_id"] == "A" and ob["entry_index"] == 0
+    assert ob["startup_order_index"] == 4 and ob["start"] == 1
+    assert ob["level_before"] == 4 and ob["deficit"] == 2
 
 
 def test_disabled_cooling_response_shape_unchanged():

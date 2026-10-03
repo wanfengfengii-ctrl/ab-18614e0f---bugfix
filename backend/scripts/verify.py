@@ -278,7 +278,67 @@ def check_shared_cooling():
         ob = d2.get("cooling_obstruction")
         if not ob or ob.get("exposure_id") != "B" or ob.get("entry_index") != 1:
             raise RuntimeError(f"expected exhaustion at B as obstruction, got {ob}")
+        if (ob.get("level_before"), ob.get("consumption"), ob.get("deficit")) != (4, 6, 2):
+            raise RuntimeError(f"unexpected obstruction ledger figures: {ob}")
         print(f"  insufficient cooling correctly infeasible; exhaustion at {ob}")
+
+        # Reversed entry vs. startup order: A entered first but pinned to t=1,
+        # B entered second pinned to t=0; actual startup order is B and three
+        # zero draws, then A. B leaves 4 units, so A (at t=1, no recovery) is
+        # the draw that cannot complete — the obstruction must name A.
+        rev_body = {
+            "horizon": 1000,
+            "exposures": [
+                {"id": "A", "duration": 1, "earliest_start": 1, "latest_start": 1,
+                 "equipment": "X", "cooling": 0, "startup_consumption": 6},
+                {"id": "B", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "Y", "cooling": 0, "startup_consumption": 6},
+                {"id": "C", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "Z", "cooling": 0, "startup_consumption": 0},
+                {"id": "D", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "W", "cooling": 0, "startup_consumption": 0},
+                {"id": "E", "duration": 1, "earliest_start": 0, "latest_start": 0,
+                 "equipment": "V", "cooling": 0, "startup_consumption": 0},
+            ],
+            "links": [],
+            "shared_cooling": {"capacity": 10, "initial": 10, "recovery": 0},
+        }
+        r_rev = cli.post("/api/schedule", json=rev_body)
+        if r_rev.status_code != 200:
+            raise RuntimeError(f"reversed-order case HTTP {r_rev.status_code}")
+        d_rev = r_rev.json()
+        if d_rev.get("feasible") is not False:
+            raise RuntimeError(f"reversed-order case must be infeasible: {d_rev}")
+        if any(d_rev.get(k) is not None for k in
+               ("starts", "finishes", "makespan", "cooling_trace")):
+            raise RuntimeError("partial schedule returned on reversed-order failure")
+        ob_rev = d_rev.get("cooling_obstruction")
+        if not ob_rev or ob_rev.get("exposure_id") != "A":
+            raise RuntimeError(
+                f"reversed order: exhaustion must be attributed to A (actual "
+                f"startup sequence), got {ob_rev}")
+        if (ob_rev.get("startup_order_index"), ob_rev.get("start"),
+                ob_rev.get("level_before"), ob_rev.get("deficit")) != (4, 1, 4, 2):
+            raise RuntimeError(f"reversed-order obstruction figures wrong: {ob_rev}")
+        print(f"  reversed entry/startup order correctly attributes exhaustion to A")
+
+        # Cooling enabled but ample: an impossible equipment packing must be
+        # reported as no_schedule WITHOUT a cooling obstruction.
+        eq_body = _cooling_five(
+            [1, 1, 1, 1, 1], {"capacity": 10, "initial": 10, "recovery": 5})
+        for eid in ("A", "B"):
+            e = next(x for x in eq_body["exposures"] if x["id"] == eid)
+            e["equipment"] = "X"
+            e["duration"] = 5
+            e["latest_start"] = 4
+        r_eq = cli.post("/api/schedule", json=eq_body)
+        if r_eq.status_code != 200 or r_eq.json().get("feasible") is not False:
+            raise RuntimeError(f"equipment-infeasible case unexpected: {r_eq.text[:200]}")
+        if r_eq.json().get("cooling_obstruction") is not None:
+            raise RuntimeError(
+                f"equipment-caused infeasibility misreported as cooling "
+                f"exhaustion: {r_eq.json().get('cooling_obstruction')}")
+        print("  equipment-caused infeasibility not misreported as cooling exhaustion")
 
         # Initial level above capacity is an input error (400), never no_schedule.
         bad_input = _cooling_five(
